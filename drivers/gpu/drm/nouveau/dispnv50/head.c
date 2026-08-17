@@ -51,6 +51,7 @@ nv50_head_flush_clr(struct nv50_head *head,
 void
 nv50_head_flush_set_wndw(struct nv50_head *head, struct nv50_head_atom *asyh)
 {
+	if (asyh->set.curs   ) head->func->curs_set(head, asyh);
 	if (asyh->set.olut   ) {
 		asyh->olut.offset = nv50_lut_load(&head->olut,
 						  asyh->olut.buffer,

@@ -158,6 +158,7 @@ struct net_bridge_vlan {
  * struct net_bridge_vlan_group
  *
  * @vlan_hash: VLAN entry rhashtable
+ * @tunnel_hash: Hash table to map from tunnel key ID (e.g. VXLAN VNI) to VLAN
  * @vlan_list: sorted VLAN entry list
  * @num_vlans: number of total VLAN entries
  * @pvid: PVID VLAN id
@@ -400,6 +401,7 @@ struct net_bridge {
 		struct rtable		fake_rtable;
 		struct rt6_info		fake_rt6_info;
 	};
+	u32				metrics[RTAX_MAX];
 #endif
 	u16				group_fwd_mask;
 	u16				group_fwd_mask_required;
@@ -931,9 +933,7 @@ static inline unsigned long br_multicast_lmqt(const struct net_bridge *br)
 
 static inline unsigned long br_multicast_gmi(const struct net_bridge *br)
 {
-	/* use the RFC default of 2 for QRV */
-	return 2 * br->multicast_query_interval +
-	       br->multicast_query_response_interval;
+	return br->multicast_membership_interval;
 }
 #else
 static inline int br_multicast_rcv(struct net_bridge *br,

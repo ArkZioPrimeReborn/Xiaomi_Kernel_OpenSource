@@ -115,7 +115,7 @@ int smu_get_dpm_freq_range(struct smu_context *smu,
 			   uint32_t *min,
 			   uint32_t *max)
 {
-	int ret = 0;
+	int ret = -ENOTSUPP;
 
 	if (!min && !max)
 		return -EINVAL;
@@ -1331,6 +1331,12 @@ static int smu_resume(void *handle)
 	smu->disable_uclk_switch = 0;
 
 	adev->pm.dpm_enabled = true;
+
+	if (smu->current_power_limit) {
+		ret = smu_set_power_limit(smu, smu->current_power_limit);
+		if (ret && ret != -EOPNOTSUPP)
+			return ret;
+	}
 
 	dev_info(adev->dev, "SMU is resumed successfully!\n");
 

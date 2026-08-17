@@ -189,6 +189,12 @@ void blk_account_io_start(struct request *req);
 void blk_account_io_done(struct request *req, u64 now);
 
 /*
+ * Plug flush limits
+ */
+#define BLK_MAX_REQUEST_COUNT	32
+#define BLK_PLUG_FLUSH_SIZE	(128 * 1024)
+
+/*
  * Internal elevator interface
  */
 #define ELV_ON_HASH(rq) ((rq)->rq_flags & RQF_HASHED)
@@ -196,8 +202,7 @@ void blk_account_io_done(struct request *req, u64 now);
 void blk_insert_flush(struct request *rq);
 
 void elevator_init_mq(struct request_queue *q);
-int elevator_switch_mq(struct request_queue *q,
-			      struct elevator_type *new_e);
+int elevator_switch(struct request_queue *q, struct elevator_type *new_e);
 void __elevator_exit(struct request_queue *, struct elevator_queue *);
 int elv_register_queue(struct request_queue *q, bool uevent);
 void elv_unregister_queue(struct request_queue *q);

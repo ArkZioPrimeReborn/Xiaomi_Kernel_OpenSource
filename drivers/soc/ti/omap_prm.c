@@ -345,6 +345,7 @@ static int omap_prm_domain_attach_dev(struct generic_pm_domain *domain,
 	if (pd_args.args_count != 0)
 		dev_warn(dev, "%s: unusupported #power-domain-cells: %i\n",
 			 prmd->pd.name, pd_args.args_count);
+	of_node_put(pd_args.np);
 
 	genpd_data = dev_gpd_data(dev);
 	genpd_data->data = NULL;
@@ -381,6 +382,8 @@ static int omap_prm_domain_init(struct device *dev, struct omap_prm *prm)
 	data = prm->data;
 	name = devm_kasprintf(dev, GFP_KERNEL, "prm_%s",
 			      data->name);
+	if (!name)
+		return -ENOMEM;
 
 	prmd->dev = dev;
 	prmd->prm = prm;
@@ -509,25 +512,28 @@ static int omap_reset_deassert(struct reset_controller_dev *rcdev,
 	writel_relaxed(v, reset->prm->base + reset->prm->data->rstctrl);
 	spin_unlock_irqrestore(&reset->lock, flags);
 
-	if (!has_rstst)
-		goto exit;
-
-	/* wait for the status to be set */
+	/* wait for the reset bit to clear */
 	ret = readl_relaxed_poll_timeout_atomic(reset->prm->base +
-						 reset->prm->data->rstst,
-						 v, v & BIT(st_bit), 1,
-						 OMAP_RESET_MAX_WAIT);
+						reset->prm->data->rstctrl,
+						v, !(v & BIT(id)), 1,
+						OMAP_RESET_MAX_WAIT);
 	if (ret)
 		pr_err("%s: timedout waiting for %s:%lu\n", __func__,
 		       reset->prm->data->name, id);
 
-exit:
-	if (reset->clkdm) {
-		/* At least dra7 iva needs a delay before clkdm idle */
-		if (has_rstst)
-			udelay(1);
-		pdata->clkdm_allow_idle(reset->clkdm);
+	/* wait for the status to be set */
+	if (has_rstst) {
+		ret = readl_relaxed_poll_timeout_atomic(reset->prm->base +
+						 reset->prm->data->rstst,
+						 v, v & BIT(st_bit), 1,
+						 OMAP_RESET_MAX_WAIT);
+		if (ret)
+			pr_err("%s: timedout waiting for %s:%lu\n", __func__,
+			       reset->prm->data->name, id);
 	}
+
+	if (reset->clkdm)
+		pdata->clkdm_allow_idle(reset->clkdm);
 
 	return ret;
 }

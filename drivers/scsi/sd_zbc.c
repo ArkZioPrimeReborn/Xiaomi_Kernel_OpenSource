@@ -155,8 +155,8 @@ static void *sd_zbc_alloc_report_buffer(struct scsi_disk *sdkp,
 
 	/*
 	 * Report zone buffer size should be at most 64B times the number of
-	 * zones requested plus the 64B reply header, but should be at least
-	 * SECTOR_SIZE for ATA devices.
+	 * zones requested plus the 64B reply header, but should be aligned
+	 * to SECTOR_SIZE for ATA devices.
 	 * Make sure that this size does not exceed the hardware capabilities.
 	 * Furthermore, since the report zone command cannot be split, make
 	 * sure that the allocated buffer can always be mapped by limiting the
@@ -169,13 +169,12 @@ static void *sd_zbc_alloc_report_buffer(struct scsi_disk *sdkp,
 	bufsize = min_t(size_t, bufsize, queue_max_segments(q) << PAGE_SHIFT);
 
 	while (bufsize >= SECTOR_SIZE) {
-		buf = __vmalloc(bufsize,
-				GFP_KERNEL | __GFP_ZERO | __GFP_NORETRY);
+		buf = kvzalloc(bufsize, GFP_KERNEL | __GFP_NORETRY);
 		if (buf) {
 			*buflen = bufsize;
 			return buf;
 		}
-		bufsize >>= 1;
+		bufsize = rounddown(bufsize >> 1, SECTOR_SIZE);
 	}
 
 	return NULL;

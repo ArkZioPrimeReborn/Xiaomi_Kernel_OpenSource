@@ -67,7 +67,7 @@
  * or last level cache. This is useful for buffers that are being mapped for
  * devices that are non-coherent, but can use the system cache.
  */
-#define DMA_ATTR_SYS_CACHE_ONLY		(1UL << 10)
+#define DMA_ATTR_SYS_CACHE_ONLY		(1UL << 14)
 
 /*
  * DMA_ATTR_SYS_CACHE_ONLY_NWA: used to indicate that the buffer should be
@@ -76,7 +76,7 @@
  * useful for buffers that are being mapped for devices that are non-coherent,
  * but can use the system cache.
  */
-#define DMA_ATTR_SYS_CACHE_ONLY_NWA	(1UL << 11)
+#define DMA_ATTR_SYS_CACHE_ONLY_NWA	(1UL << 15)
 
 /*
  * A dma_addr_t can hold any valid DMA or bus address for the platform.  It can
@@ -217,8 +217,8 @@ static inline void *dma_alloc_attrs(struct device *dev, size_t size,
 {
 	return NULL;
 }
-static void dma_free_attrs(struct device *dev, size_t size, void *cpu_addr,
-		dma_addr_t dma_handle, unsigned long attrs)
+static inline void dma_free_attrs(struct device *dev, size_t size,
+		void *cpu_addr, dma_addr_t dma_handle, unsigned long attrs)
 {
 }
 static inline void *dmam_alloc_attrs(struct device *dev, size_t size,
@@ -585,10 +585,14 @@ static inline int dma_mmap_wc(struct device *dev,
 #else
 #define DEFINE_DMA_UNMAP_ADDR(ADDR_NAME)
 #define DEFINE_DMA_UNMAP_LEN(LEN_NAME)
-#define dma_unmap_addr(PTR, ADDR_NAME)           (0)
-#define dma_unmap_addr_set(PTR, ADDR_NAME, VAL)  do { } while (0)
-#define dma_unmap_len(PTR, LEN_NAME)             (0)
-#define dma_unmap_len_set(PTR, LEN_NAME, VAL)    do { } while (0)
+#define dma_unmap_addr(PTR, ADDR_NAME)           \
+	({ typeof(PTR) __p __maybe_unused = PTR; 0; })
+#define dma_unmap_addr_set(PTR, ADDR_NAME, VAL)  \
+	do { typeof(PTR) __p __maybe_unused = PTR; } while (0)
+#define dma_unmap_len(PTR, LEN_NAME)             \
+	({ typeof(PTR) __p __maybe_unused = PTR; 0; })
+#define dma_unmap_len_set(PTR, LEN_NAME, VAL)    \
+	do { typeof(PTR) __p __maybe_unused = PTR; } while (0)
 #endif
 
 /*

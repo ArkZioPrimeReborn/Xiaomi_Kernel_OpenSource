@@ -46,6 +46,9 @@ static int pool_op_alloc(struct tee_shm_pool_mgr *poolm,
 			page++;
 		}
 
+		for (i = 0; i < nr_pages; i++)
+			pages[i] = page + i;
+
 		shm->flags |= TEE_SHM_REGISTER;
 		rc = optee_shm_register(shm->ctx, shm, pages, nr_pages,
 					(unsigned long)shm->kaddr);

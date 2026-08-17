@@ -710,8 +710,7 @@ int __btrfs_drop_extents(struct btrfs_trans_handle *trans,
 	if (start >= inode->disk_i_size && !replace_extent)
 		modify_tree = 0;
 
-	update_refs = (test_bit(BTRFS_ROOT_SHAREABLE, &root->state) ||
-		       root == fs_info->tree_root);
+	update_refs = (root->root_key.objectid != BTRFS_TREE_LOG_OBJECTID);
 	while (1) {
 		recow = 0;
 		ret = btrfs_lookup_file_extent(trans, root, path, ino,
@@ -985,8 +984,7 @@ delete_extent_item:
 	 * write lock.
 	 */
 	if (!ret && replace_extent && leafs_visited == 1 &&
-	    (path->locks[0] == BTRFS_WRITE_LOCK_BLOCKING ||
-	     path->locks[0] == BTRFS_WRITE_LOCK) &&
+	    path->locks[0] == BTRFS_WRITE_LOCK &&
 	    btrfs_leaf_free_space(leaf) >=
 	    sizeof(struct btrfs_item) + extent_item_size) {
 
@@ -2662,14 +2660,16 @@ int btrfs_replace_file_extents(struct inode *inode, struct btrfs_path *path,
 					   1, 0, 0, NULL);
 		if (ret != -ENOSPC) {
 			/*
-			 * When cloning we want to avoid transaction aborts when
-			 * nothing was done and we are attempting to clone parts
-			 * of inline extents, in such cases -EOPNOTSUPP is
-			 * returned by __btrfs_drop_extents() without having
-			 * changed anything in the file.
+			 * The only time we don't want to abort is if we are
+			 * attempting to clone a partial inline extent, in which
+			 * case we'll get EOPNOTSUPP.  However if we aren't
+			 * clone we need to abort no matter what, because if we
+			 * got EOPNOTSUPP via prealloc then we messed up and
+			 * need to abort.
 			 */
-			if (extent_info && !extent_info->is_new_extent &&
-			    ret && ret != -EOPNOTSUPP)
+			if (ret &&
+			    (ret != -EOPNOTSUPP ||
+			     (extent_info && extent_info->is_new_extent)))
 				btrfs_abort_transaction(trans, ret);
 			break;
 		}
@@ -2832,8 +2832,9 @@ out:
 	return ret;
 }
 
-static int btrfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
+static int btrfs_punch_hole(struct file *file, loff_t offset, loff_t len)
 {
+	struct inode *inode = file_inode(file);
 	struct btrfs_fs_info *fs_info = btrfs_sb(inode->i_sb);
 	struct btrfs_root *root = BTRFS_I(inode)->root;
 	struct extent_state *cached_state = NULL;
@@ -2864,6 +2865,10 @@ static int btrfs_punch_hole(struct inode *inode, loff_t offset, loff_t len)
 		ret = 0;
 		goto out_only_mutex;
 	}
+
+	ret = file_modified(file);
+	if (ret)
+		goto out_only_mutex;
 
 	lockstart = round_up(offset, btrfs_inode_sectorsize(BTRFS_I(inode)));
 	lockend = round_down(offset + len,
@@ -3044,11 +3049,21 @@ static int btrfs_fallocate_update_isize(struct inode *inode,
 {
 	struct btrfs_trans_handle *trans;
 	struct btrfs_root *root = BTRFS_I(inode)->root;
+	u64 range_start;
+	u64 range_end;
 	int ret;
 	int ret2;
 
 	if (mode & FALLOC_FL_KEEP_SIZE || end <= i_size_read(inode))
 		return 0;
+
+	range_start = round_down(i_size_read(inode), root->fs_info->sectorsize);
+	range_end = round_up(end, root->fs_info->sectorsize);
+
+	ret = btrfs_inode_set_file_extent_range(BTRFS_I(inode), range_start,
+						range_end - range_start);
+	if (ret)
+		return ret;
 
 	trans = btrfs_start_transaction(root, 1);
 	if (IS_ERR(trans))
@@ -3300,7 +3315,7 @@ static long btrfs_fallocate(struct file *file, int mode,
 		return -EOPNOTSUPP;
 
 	if (mode & FALLOC_FL_PUNCH_HOLE)
-		return btrfs_punch_hole(inode, offset, len);
+		return btrfs_punch_hole(file, offset, len);
 
 	/*
 	 * Only trigger disk allocation, don't trigger qgroup reserve
@@ -3321,6 +3336,10 @@ static long btrfs_fallocate(struct file *file, int mode,
 		if (ret)
 			goto out;
 	}
+
+	ret = file_modified(file);
+	if (ret)
+		goto out;
 
 	/*
 	 * TODO: Move these two operations after we have checked

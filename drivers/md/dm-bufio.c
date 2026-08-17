@@ -19,6 +19,8 @@
 #include <linux/rbtree.h>
 #include <linux/stacktrace.h>
 
+#include <trace/hooks/mm.h>
+
 #define DM_MSG_PREFIX "bufio"
 
 /*
@@ -1375,7 +1377,9 @@ int dm_bufio_issue_discard(struct dm_bufio_client *c, sector_t block, sector_t c
 	struct dm_io_region io_reg = {
 		.bdev = c->bdev,
 		.sector = block_to_sector(c, block),
-		.count = block_to_sector(c, count),
+		.count = likely(c->sectors_per_block_bits >= 0) ?
+			count << c->sectors_per_block_bits :
+			count * (c->block_size >> SECTOR_SHIFT),
 	};
 
 	BUG_ON(dm_bufio_in_request());
@@ -1683,6 +1687,13 @@ static void shrink_work(struct work_struct *w)
 static unsigned long dm_bufio_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
 {
 	struct dm_bufio_client *c;
+	bool bypass = false;
+
+	trace_android_vh_dm_bufio_shrink_scan_bypass(
+			dm_bufio_current_allocated,
+			&bypass);
+	if (bypass)
+		return 0;
 
 	c = container_of(shrink, struct dm_bufio_client, shrinker);
 	atomic_long_add(sc->nr_to_scan, &c->need_shrink);
@@ -2009,6 +2020,14 @@ static void cleanup_old_buffers(void)
 {
 	unsigned long max_age_hz = get_max_age_hz();
 	struct dm_bufio_client *c;
+	bool bypass = false;
+
+	trace_android_vh_cleanup_old_buffers_bypass(
+				dm_bufio_current_allocated,
+				&max_age_hz,
+				&bypass);
+	if (bypass)
+		return;
 
 	mutex_lock(&dm_bufio_clients_lock);
 

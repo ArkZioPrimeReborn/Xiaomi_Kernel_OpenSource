@@ -105,7 +105,8 @@ struct nexthop {
 };
 
 enum nexthop_event_type {
-	NEXTHOP_EVENT_DEL
+	NEXTHOP_EVENT_DEL,
+	NEXTHOP_EVENT_REPLACE,
 };
 
 int register_nexthop_notifier(struct net *net, struct notifier_block *nb);
@@ -211,7 +212,7 @@ int nexthop_mpath_fill_node(struct sk_buff *skb, struct nexthop *nh,
 		struct fib_nh_common *nhc = &nhi->fib_nhc;
 		int weight = nhg->nh_entries[i].weight;
 
-		if (fib_add_nexthop(skb, nhc, weight, rt_family) < 0)
+		if (fib_add_nexthop(skb, nhc, weight, rt_family, 0) < 0)
 			return -EMSGSIZE;
 	}
 

@@ -17,6 +17,7 @@
 #include <linux/types.h>
 #include <linux/workqueue.h>
 #include <linux/percpu-refcount.h>
+#include <linux/cleanup.h>
 
 
 /*
@@ -187,6 +188,8 @@ void kfree_sensitive(const void *);
 size_t __ksize(const void *);
 size_t ksize(const void *);
 
+DEFINE_FREE(kfree, void *, if (!IS_ERR_OR_NULL(_T)) kfree(_T))
+
 #ifdef CONFIG_HAVE_HARDENED_USERCOPY_ALLOCATOR
 void __check_heap_object(const void *ptr, unsigned long n, struct page *page,
 			bool to_user);
@@ -215,6 +218,18 @@ static inline void __check_heap_object(const void *ptr, unsigned long n,
  */
 #ifndef ARCH_SLAB_MINALIGN
 #define ARCH_SLAB_MINALIGN __alignof__(unsigned long long)
+#endif
+
+/*
+ * Arches can define this function if they want to decide the minimum slab
+ * alignment at runtime. The value returned by the function must be a power
+ * of two and >= ARCH_SLAB_MINALIGN.
+ */
+#ifndef arch_slab_minalign
+static inline unsigned int arch_slab_minalign(void)
+{
+	return ARCH_SLAB_MINALIGN;
+}
 #endif
 
 /*
@@ -590,6 +605,24 @@ static inline void *kmalloc_array(size_t n, size_t size, gfp_t flags)
 	if (__builtin_constant_p(n) && __builtin_constant_p(size))
 		return kmalloc(bytes, flags);
 	return __kmalloc(bytes, flags);
+}
+
+/**
+ * krealloc_array - reallocate memory for an array.
+ * @p: pointer to the memory chunk to reallocate
+ * @new_n: new number of elements to alloc
+ * @new_size: new size of a single member of the array
+ * @flags: the type of memory to allocate (see kmalloc)
+ */
+static __must_check inline void *
+krealloc_array(void *p, size_t new_n, size_t new_size, gfp_t flags)
+{
+	size_t bytes;
+
+	if (unlikely(check_mul_overflow(new_n, new_size, &bytes)))
+		return NULL;
+
+	return krealloc(p, bytes, flags);
 }
 
 /**

@@ -8,6 +8,7 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/iopoll.h>
 #include <linux/ioport.h>
 #include <linux/irq.h>
 #include <linux/of_address.h>
@@ -711,21 +712,23 @@ static inline void msdc_dma_setup(struct msdc_host *host, struct msdc_dma *dma,
 	writel(lower_32_bits(dma->gpd_addr), host->base + MSDC_DMA_SA);
 }
 
-static void msdc_prepare_data(struct msdc_host *host, struct mmc_request *mrq)
+static void msdc_prepare_data(struct msdc_host *host, struct mmc_data *data)
 {
-	struct mmc_data *data = mrq->data;
-
 	if (!(data->host_cookie & MSDC_PREPARE_FLAG)) {
-		data->host_cookie |= MSDC_PREPARE_FLAG;
 		data->sg_count = dma_map_sg(host->dev, data->sg, data->sg_len,
 					    mmc_get_dma_dir(data));
+		if (data->sg_count)
+			data->host_cookie |= MSDC_PREPARE_FLAG;
 	}
 }
 
-static void msdc_unprepare_data(struct msdc_host *host, struct mmc_request *mrq)
+static bool msdc_data_prepared(struct mmc_data *data)
 {
-	struct mmc_data *data = mrq->data;
+	return data->host_cookie & MSDC_PREPARE_FLAG;
+}
 
+static void msdc_unprepare_data(struct msdc_host *host, struct mmc_data *data)
+{
 	if (data->host_cookie & MSDC_ASYNC_FLAG)
 		return;
 
@@ -1139,7 +1142,7 @@ static void msdc_request_done(struct msdc_host *host, struct mmc_request *mrq)
 
 	msdc_track_cmd_data(host, mrq->cmd, mrq->data);
 	if (mrq->data)
-		msdc_unprepare_data(host, mrq);
+		msdc_unprepare_data(host, mrq->data);
 	if (host->error)
 		msdc_reset_hw(host);
 	mmc_request_done(mmc_from_priv(host), mrq);
@@ -1309,8 +1312,19 @@ static void msdc_ops_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	WARN_ON(host->mrq);
 	host->mrq = mrq;
 
-	if (mrq->data)
-		msdc_prepare_data(host, mrq);
+	if (mrq->data) {
+		msdc_prepare_data(host, mrq->data);
+		if (!msdc_data_prepared(mrq->data)) {
+			host->mrq = NULL;
+			/*
+			 * Failed to prepare DMA area, fail fast before
+			 * starting any commands.
+			 */
+			mrq->cmd->error = -ENOSPC;
+			mmc_request_done(mmc_from_priv(host), mrq);
+			return;
+		}
+	}
 
 	/* if SBC is required, we have HW option and SW option.
 	 * if HW option is enabled, and SBC does not have "special" flags,
@@ -1331,7 +1345,7 @@ static void msdc_pre_req(struct mmc_host *mmc, struct mmc_request *mrq)
 	if (!data)
 		return;
 
-	msdc_prepare_data(host, mrq);
+	msdc_prepare_data(host, data);
 	data->host_cookie |= MSDC_ASYNC_FLAG;
 }
 
@@ -1339,14 +1353,14 @@ static void msdc_post_req(struct mmc_host *mmc, struct mmc_request *mrq,
 		int err)
 {
 	struct msdc_host *host = mmc_priv(mmc);
-	struct mmc_data *data;
+	struct mmc_data *data = mrq->data;
 
-	data = mrq->data;
 	if (!data)
 		return;
+
 	if (data->host_cookie) {
 		data->host_cookie &= ~MSDC_ASYNC_FLAG;
-		msdc_unprepare_data(host, mrq);
+		msdc_unprepare_data(host, data);
 	}
 }
 
@@ -2310,15 +2324,22 @@ static void msdc_cqe_enable(struct mmc_host *mmc)
 static void msdc_cqe_disable(struct mmc_host *mmc, bool recovery)
 {
 	struct msdc_host *host = mmc_priv(mmc);
+	unsigned int val = 0;
 
 	/* disable cmdq irq */
 	sdr_clr_bits(host->base + MSDC_INTEN, MSDC_INT_CMDQ);
 	/* disable busy check */
 	sdr_clr_bits(host->base + MSDC_PATCH_BIT1, MSDC_PB1_BUSY_CHECK_SEL);
 
+	val = readl(host->base + MSDC_INT);
+	writel(val, host->base + MSDC_INT);
+
 	if (recovery) {
 		sdr_set_field(host->base + MSDC_DMA_CTRL,
 			      MSDC_DMA_CTRL_STOP, 1);
+		if (WARN_ON(readl_poll_timeout(host->base + MSDC_DMA_CFG, val,
+			!(val & MSDC_DMA_CFG_STS), 1, 3000)))
+			return;
 		msdc_reset_hw(host);
 	}
 }
@@ -2475,7 +2496,7 @@ static int msdc_drv_probe(struct platform_device *pdev)
 
 	host->irq = platform_get_irq(pdev, 0);
 	if (host->irq < 0) {
-		ret = -EINVAL;
+		ret = host->irq;
 		goto host_free;
 	}
 
@@ -2543,6 +2564,25 @@ static int msdc_drv_probe(struct platform_device *pdev)
 		host->dma_mask = DMA_BIT_MASK(32);
 	mmc_dev(mmc)->dma_mask = &host->dma_mask;
 
+	host->timeout_clks = 3 * 1048576;
+	host->dma.gpd = dma_alloc_coherent(&pdev->dev,
+				2 * sizeof(struct mt_gpdma_desc),
+				&host->dma.gpd_addr, GFP_KERNEL);
+	host->dma.bd = dma_alloc_coherent(&pdev->dev,
+				MAX_BD_NUM * sizeof(struct mt_bdma_desc),
+				&host->dma.bd_addr, GFP_KERNEL);
+	if (!host->dma.gpd || !host->dma.bd) {
+		ret = -ENOMEM;
+		goto release_mem;
+	}
+	msdc_init_gpd_bd(host, &host->dma);
+	INIT_DELAYED_WORK(&host->req_timeout, msdc_request_timeout);
+	spin_lock_init(&host->lock);
+
+	platform_set_drvdata(pdev, mmc);
+	msdc_ungate_clock(host);
+	msdc_init_hw(host);
+
 	if (mmc->caps2 & MMC_CAP2_CQE) {
 		host->cq_host = devm_kzalloc(mmc->parent,
 					     sizeof(*host->cq_host),
@@ -2562,25 +2602,6 @@ static int msdc_drv_probe(struct platform_device *pdev)
 		/* 0 size, means 65536 so we don't have to -1 here */
 		mmc->max_seg_size = 64 * 1024;
 	}
-
-	host->timeout_clks = 3 * 1048576;
-	host->dma.gpd = dma_alloc_coherent(&pdev->dev,
-				2 * sizeof(struct mt_gpdma_desc),
-				&host->dma.gpd_addr, GFP_KERNEL);
-	host->dma.bd = dma_alloc_coherent(&pdev->dev,
-				MAX_BD_NUM * sizeof(struct mt_bdma_desc),
-				&host->dma.bd_addr, GFP_KERNEL);
-	if (!host->dma.gpd || !host->dma.bd) {
-		ret = -ENOMEM;
-		goto release_mem;
-	}
-	msdc_init_gpd_bd(host, &host->dma);
-	INIT_DELAYED_WORK(&host->req_timeout, msdc_request_timeout);
-	spin_lock_init(&host->lock);
-
-	platform_set_drvdata(pdev, mmc);
-	msdc_ungate_clock(host);
-	msdc_init_hw(host);
 
 	ret = devm_request_irq(&pdev->dev, host->irq, msdc_irq,
 			       IRQF_TRIGGER_NONE, pdev->name, host);
@@ -2732,11 +2753,14 @@ static int __maybe_unused msdc_suspend(struct device *dev)
 {
 	struct mmc_host *mmc = dev_get_drvdata(dev);
 	int ret;
+	u32 val;
 
 	if (mmc->caps2 & MMC_CAP2_CQE) {
 		ret = cqhci_suspend(mmc);
 		if (ret)
 			return ret;
+		val = readl(((struct msdc_host *)mmc_priv(mmc))->base + MSDC_INT);
+		writel(val, ((struct msdc_host *)mmc_priv(mmc))->base + MSDC_INT);
 	}
 
 	return pm_runtime_force_suspend(dev);

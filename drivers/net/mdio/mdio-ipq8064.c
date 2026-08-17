@@ -13,6 +13,11 @@
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/mfd/syscon.h>
+#include <linux/module.h>
+#include <linux/of_mdio.h>
+#include <linux/of_address.h>
+#include <linux/platform_device.h>
+#include <linux/regmap.h>
 
 /* MII address register definitions */
 #define MII_ADDR_REG_ADDR                       0x10

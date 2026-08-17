@@ -988,7 +988,7 @@ cipso_cache_enable - BOOLEAN
 cipso_cache_bucket_size - INTEGER
 	The CIPSO label cache consists of a fixed size hash table with each
 	hash bucket containing a number of cache entries.  This variable limits
-	the number of entries in each hash bucket; the larger the value the
+	the number of entries in each hash bucket; the larger the value is, the
 	more CIPSO label mappings that can be cached.  When the number of
 	entries in a given hash bucket reaches this limit adding new entries
 	causes the oldest entry in the bucket to be removed to make room.
@@ -1093,7 +1093,7 @@ ip_autobind_reuse - BOOLEAN
 	option should only be set by experts.
 	Default: 0
 
-ip_dynaddr - BOOLEAN
+ip_dynaddr - INTEGER
 	If set non-zero, enables support for dynamic addresses.
 	If set to a non-zero value larger than 1, a kernel log
 	message will be printed when dynamic address rewriting
@@ -1902,6 +1902,14 @@ accept_ra_min_hop_limit - INTEGER
 
 	Default: 1
 
+accept_ra_min_lft - INTEGER
+	Minimum acceptable lifetime value in Router Advertisement.
+
+	RA sections with a lifetime less than this value shall be
+	ignored. Zero lifetimes stay unaffected.
+
+	Default: 0
+
 accept_ra_pinfo - BOOLEAN
 	Learn Prefix Information in Router Advertisement.
 
@@ -1909,6 +1917,20 @@ accept_ra_pinfo - BOOLEAN
 
 		- enabled if accept_ra is enabled.
 		- disabled if accept_ra is disabled.
+
+ra_honor_pio_pflag - BOOLEAN
+	The Prefix Information Option P-flag indicates the network can
+	allocate a unique IPv6 prefix per client using DHCPv6-PD.
+	This sysctl can be enabled when a userspace DHCPv6-PD client
+	is running to cause the P-flag to take effect: i.e. the
+	P-flag suppresses any effects of the A-flag within the same
+	PIO. For a given PIO, P=1 and A=1 is treated as A=0.
+
+	- If disabled, the P-flag is ignored.
+	- If enabled, the P-flag will disable SLAAC autoconfiguration
+	  for the given Prefix Information Option.
+
+	Default: 0 (disabled)
 
 accept_ra_rt_info_min_plen - INTEGER
 	Minimum prefix length of Route Information in RA.
@@ -2642,7 +2664,14 @@ sctp_rmem - vector of 3 INTEGERs: min, default, max
 	Default: 4K
 
 sctp_wmem  - vector of 3 INTEGERs: min, default, max
-	Currently this tunable has no effect.
+	Only the first value ("min") is used, "default" and "max" are
+	ignored.
+
+	min: Minimum size of send buffer that can be used by SCTP sockets.
+	It is guaranteed to each SCTP socket (but not association) even
+	under moderate memory pressure.
+
+	Default: 4K
 
 addr_scope_policy - INTEGER
 	Control IPv4 address scoping - draft-stewart-tsvwg-sctp-ipv4-00

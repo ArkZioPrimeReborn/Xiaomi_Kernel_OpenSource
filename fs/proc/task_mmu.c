@@ -9,6 +9,7 @@
 #include <linux/ptrace.h>
 #include <linux/slab.h>
 #include <linux/pagemap.h>
+#include <linux/pgsize_migration.h>
 #include <linux/mempolicy.h>
 #include <linux/rmap.h>
 #include <linux/swap.h>
@@ -337,7 +338,7 @@ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
 	}
 
 	start = vma->vm_start;
-	end = vma->vm_end;
+	end = VMA_PAD_START(vma);
 	show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
 
 	/*
@@ -390,7 +391,13 @@ done:
 
 static int show_map(struct seq_file *m, void *v)
 {
-	show_map_vma(m, v);
+	struct vm_area_struct *vma = v;
+
+	if (vma_pages(vma))
+		show_map_vma(m, vma);
+
+	show_map_pad_vma(vma, m, show_map_vma, false);
+
 	return 0;
 }
 
@@ -487,7 +494,8 @@ static void smaps_page_accumulate(struct mem_size_stats *mss,
 }
 
 static void smaps_account(struct mem_size_stats *mss, struct page *page,
-		bool compound, bool young, bool dirty, bool locked)
+		bool compound, bool young, bool dirty, bool locked,
+		bool migration)
 {
 	int i, nr = compound ? compound_nr(page) : 1;
 	unsigned long size = nr * PAGE_SIZE;
@@ -514,8 +522,15 @@ static void smaps_account(struct mem_size_stats *mss, struct page *page,
 	 * page_count(page) == 1 guarantees the page is mapped exactly once.
 	 * If any subpage of the compound page mapped with PTE it would elevate
 	 * page_count().
+	 *
+	 * The page_mapcount() is called to get a snapshot of the mapcount.
+	 * Without holding the page lock this snapshot can be slightly wrong as
+	 * we cannot always read the mapcount atomically.  It is not safe to
+	 * call page_mapcount() even with PTL held if the page is not mapped,
+	 * especially for migration entries.  Treat regular migration entries
+	 * as mapcount == 1.
 	 */
-	if (page_count(page) == 1) {
+	if ((page_count(page) == 1) || migration) {
 		smaps_page_accumulate(mss, page, size, size << PSS_SHIFT, dirty,
 			locked, true);
 		return;
@@ -552,9 +567,12 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 	struct vm_area_struct *vma = walk->vma;
 	bool locked = !!(vma->vm_flags & VM_LOCKED);
 	struct page *page = NULL;
+	bool migration = false, young = false, dirty = false;
 
 	if (pte_present(*pte)) {
 		page = vm_normal_page(vma, addr, *pte);
+		young = pte_young(*pte);
+		dirty = pte_dirty(*pte);
 	} else if (is_swap_pte(*pte)) {
 		swp_entry_t swpent = pte_to_swp_entry(*pte);
 
@@ -571,9 +589,10 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 			} else {
 				mss->swap_pss += (u64)PAGE_SIZE << PSS_SHIFT;
 			}
-		} else if (is_migration_entry(swpent))
+		} else if (is_migration_entry(swpent)) {
+			migration = true;
 			page = migration_entry_to_page(swpent);
-		else if (is_device_private_entry(swpent))
+		} else if (is_device_private_entry(swpent))
 			page = device_private_entry_to_page(swpent);
 	} else if (unlikely(IS_ENABLED(CONFIG_SHMEM) && mss->check_shmem_swap
 							&& pte_none(*pte))) {
@@ -587,7 +606,7 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
 	if (!page)
 		return;
 
-	smaps_account(mss, page, false, pte_young(*pte), pte_dirty(*pte), locked);
+	smaps_account(mss, page, false, young, dirty, locked, migration);
 }
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -598,6 +617,7 @@ static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,
 	struct vm_area_struct *vma = walk->vma;
 	bool locked = !!(vma->vm_flags & VM_LOCKED);
 	struct page *page = NULL;
+	bool migration = false;
 
 	if (pmd_present(*pmd)) {
 		/* FOLL_DUMP will return -EFAULT on huge zero page */
@@ -605,8 +625,10 @@ static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,
 	} else if (unlikely(thp_migration_supported() && is_swap_pmd(*pmd))) {
 		swp_entry_t entry = pmd_to_swp_entry(*pmd);
 
-		if (is_migration_entry(entry))
+		if (is_migration_entry(entry)) {
+			migration = true;
 			page = migration_entry_to_page(entry);
+		}
 	}
 	if (IS_ERR_OR_NULL(page))
 		return;
@@ -618,7 +640,9 @@ static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,
 		/* pass */;
 	else
 		mss->file_thp += HPAGE_PMD_SIZE;
-	smaps_account(mss, page, true, pmd_young(*pmd), pmd_dirty(*pmd), locked);
+
+	smaps_account(mss, page, true, pmd_young(*pmd), pmd_dirty(*pmd),
+		      locked, migration);
 }
 #else
 static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,
@@ -757,9 +781,7 @@ static int smaps_hugetlb_range(pte_t *pte, unsigned long hmask,
 			page = device_private_entry_to_page(swpent);
 	}
 	if (page) {
-		int mapcount = page_mapcount(page);
-
-		if (mapcount >= 2)
+		if (page_mapcount(page) >= 2 || hugetlb_pmd_shared(pte))
 			mss->shared_hugetlb += huge_page_size(hstate_vma(vma));
 		else
 			mss->private_hugetlb += huge_page_size(hstate_vma(vma));
@@ -791,9 +813,10 @@ static void smap_gather_stats(struct vm_area_struct *vma,
 		struct mem_size_stats *mss, unsigned long start)
 {
 	const struct mm_walk_ops *ops = &smaps_walk_ops;
+	unsigned long end = VMA_PAD_START(vma);
 
 	/* Invalid start */
-	if (start >= vma->vm_end)
+	if (start >= end)
 		return;
 
 #ifdef CONFIG_SHMEM
@@ -813,7 +836,15 @@ static void smap_gather_stats(struct vm_area_struct *vma,
 		unsigned long shmem_swapped = shmem_swap_usage(vma);
 
 		if (!start && (!shmem_swapped || (vma->vm_flags & VM_SHARED) ||
-					!(vma->vm_flags & VM_WRITE))) {
+					!(vma->vm_flags & VM_WRITE)) &&
+					/*
+					 * Only if we don't have padding can we use the fast path
+					 * shmem_inode_info->swapped for shmem_swapped.
+					 *
+					 * Else we'll walk the page table to calculate
+					 * shmem_swapped, (excluding the padding region).
+					 */
+					end == vma->vm_end) {
 			mss->swap += shmem_swapped;
 		} else {
 			mss->check_shmem_swap = true;
@@ -823,9 +854,9 @@ static void smap_gather_stats(struct vm_area_struct *vma,
 #endif
 	/* mmap_lock is held in m_start */
 	if (!start)
-		walk_page_vma(vma, ops, mss);
+		walk_page_range(vma->vm_mm, vma->vm_start, end, ops, mss);
 	else
-		walk_page_range(vma->vm_mm, start, vma->vm_end, ops, mss);
+		walk_page_range(vma->vm_mm, start, end, ops, mss);
 }
 
 #define SEQ_PUT_DEC(str, val) \
@@ -877,6 +908,9 @@ static int show_smap(struct seq_file *m, void *v)
 
 	memset(&mss, 0, sizeof(mss));
 
+	if (!vma_pages(vma))
+		goto show_pad;
+
 	smap_gather_stats(vma, &mss, 0);
 
 	show_map_vma(m, vma);
@@ -886,7 +920,7 @@ static int show_smap(struct seq_file *m, void *v)
 		seq_putc(m, '\n');
 	}
 
-	SEQ_PUT_DEC("Size:           ", vma->vm_end - vma->vm_start);
+	SEQ_PUT_DEC("Size:           ", VMA_PAD_START(vma) - vma->vm_start);
 	SEQ_PUT_DEC(" kB\nKernelPageSize: ", vma_kernel_pagesize(vma));
 	SEQ_PUT_DEC(" kB\nMMUPageSize:    ", vma_mmu_pagesize(vma));
 	seq_puts(m, " kB\n");
@@ -899,6 +933,9 @@ static int show_smap(struct seq_file *m, void *v)
 	if (arch_pkeys_enabled())
 		seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
 	show_smap_vma_flags(m, vma);
+
+show_pad:
+	show_map_pad_vma(vma, m, show_smap, true);
 
 	return 0;
 }
@@ -999,7 +1036,7 @@ static int show_smaps_rollup(struct seq_file *m, void *v)
 		vma = vma->vm_next;
 	}
 
-	show_vma_header_prefix(m, priv->mm->mmap->vm_start,
+	show_vma_header_prefix(m, priv->mm->mmap ? priv->mm->mmap->vm_start : 0,
 			       last_vma_end, 0, 0, 0, 0);
 	seq_pad(m, ' ');
 	seq_puts(m, "[rollup]\n");
@@ -1434,6 +1471,7 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 {
 	u64 frame = 0, flags = 0;
 	struct page *page = NULL;
+	bool migration = false;
 
 	if (pte_present(pte)) {
 		if (pm->show_pfn)
@@ -1451,8 +1489,10 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 			frame = swp_type(entry) |
 				(swp_offset(entry) << MAX_SWAPFILES_SHIFT);
 		flags |= PM_SWAP;
-		if (is_migration_entry(entry))
+		if (is_migration_entry(entry)) {
+			migration = true;
 			page = migration_entry_to_page(entry);
+		}
 
 		if (is_device_private_entry(entry))
 			page = device_private_entry_to_page(entry);
@@ -1460,7 +1500,7 @@ static pagemap_entry_t pte_to_pagemap_entry(struct pagemapread *pm,
 
 	if (page && !PageAnon(page))
 		flags |= PM_FILE;
-	if (page && page_mapcount(page) == 1)
+	if (page && !migration && page_mapcount(page) == 1)
 		flags |= PM_MMAP_EXCLUSIVE;
 	if (vma->vm_flags & VM_SOFTDIRTY)
 		flags |= PM_SOFT_DIRTY;
@@ -1476,8 +1516,9 @@ static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
 	spinlock_t *ptl;
 	pte_t *pte, *orig_pte;
 	int err = 0;
-
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	bool migration = false;
+
 	ptl = pmd_trans_huge_lock(pmdp, vma);
 	if (ptl) {
 		u64 flags = 0, frame = 0;
@@ -1512,11 +1553,14 @@ static int pagemap_pmd_range(pmd_t *pmdp, unsigned long addr, unsigned long end,
 			if (pmd_swp_soft_dirty(pmd))
 				flags |= PM_SOFT_DIRTY;
 			VM_BUG_ON(!is_pmd_migration_entry(pmd));
+			migration = is_migration_entry(entry);
 			page = migration_entry_to_page(entry);
 		}
 #endif
 
-		if (page && page_mapcount(page) == 1)
+		if (page && !PageAnon(page))
+			flags |= PM_FILE;
+		if (page && !migration && page_mapcount(page) == 1)
 			flags |= PM_MMAP_EXCLUSIVE;
 
 		for (; addr != end; addr += PAGE_SIZE) {

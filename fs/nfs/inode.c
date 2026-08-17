@@ -195,7 +195,19 @@ bool nfs_check_cache_invalid(struct inode *inode, unsigned long flags)
 }
 EXPORT_SYMBOL_GPL(nfs_check_cache_invalid);
 
-static void nfs_set_cache_invalid(struct inode *inode, unsigned long flags)
+#ifdef CONFIG_NFS_V4_2
+static bool nfs_has_xattr_cache(const struct nfs_inode *nfsi)
+{
+	return nfsi->xattr_cache != NULL;
+}
+#else
+static bool nfs_has_xattr_cache(const struct nfs_inode *nfsi)
+{
+	return false;
+}
+#endif
+
+void nfs_set_cache_invalid(struct inode *inode, unsigned long flags)
 {
 	struct nfs_inode *nfsi = NFS_I(inode);
 	bool have_delegation = NFS_PROTO(inode)->have_delegation(inode, FMODE_READ);
@@ -210,6 +222,8 @@ static void nfs_set_cache_invalid(struct inode *inode, unsigned long flags)
 	} else if (flags & NFS_INO_REVAL_PAGECACHE)
 		flags |= NFS_INO_INVALID_CHANGE | NFS_INO_INVALID_SIZE;
 
+	if (!nfs_has_xattr_cache(nfsi))
+		flags &= ~NFS_INO_INVALID_XATTR;
 	if (inode->i_mapping->nrpages == 0)
 		flags &= ~(NFS_INO_INVALID_DATA|NFS_INO_DATA_INVAL_DEFER);
 	nfsi->cache_validity |= flags;
@@ -807,12 +821,9 @@ int nfs_getattr(const struct path *path, struct kstat *stat,
 	}
 
 	/* Flush out writes to the server in order to update c/mtime.  */
-	if ((request_mask & (STATX_CTIME|STATX_MTIME)) &&
-			S_ISREG(inode->i_mode)) {
-		err = filemap_write_and_wait(inode->i_mapping);
-		if (err)
-			goto out;
-	}
+	if ((request_mask & (STATX_CTIME | STATX_MTIME)) &&
+	    S_ISREG(inode->i_mode))
+		filemap_write_and_wait(inode->i_mapping);
 
 	/*
 	 * We may force a getattr if the user cares about atime.
@@ -1054,8 +1065,8 @@ void nfs_inode_attach_open_context(struct nfs_open_context *ctx)
 	spin_lock(&inode->i_lock);
 	if (list_empty(&nfsi->open_files) &&
 	    (nfsi->cache_validity & NFS_INO_DATA_INVAL_DEFER))
-		nfsi->cache_validity |= NFS_INO_INVALID_DATA |
-			NFS_INO_REVAL_FORCED;
+		nfs_set_cache_invalid(inode, NFS_INO_INVALID_DATA |
+						     NFS_INO_REVAL_FORCED);
 	list_add_tail_rcu(&ctx->list, &nfsi->open_files);
 	spin_unlock(&inode->i_lock);
 }
@@ -1128,7 +1139,6 @@ int nfs_open(struct inode *inode, struct file *filp)
 	nfs_fscache_open_file(inode, filp);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(nfs_open);
 
 /*
  * This function is called whenever some part of NFS notices that
@@ -1522,6 +1532,7 @@ void nfs_fattr_init(struct nfs_fattr *fattr)
 	fattr->gencount = nfs_inc_attr_generation_counter();
 	fattr->owner_name = NULL;
 	fattr->group_name = NULL;
+	fattr->mdsthreshold = NULL;
 }
 EXPORT_SYMBOL_GPL(nfs_fattr_init);
 
@@ -1896,7 +1907,11 @@ static int nfs_update_inode(struct inode *inode, struct nfs_fattr *fattr)
 	nfs_wcc_update_inode(inode, fattr);
 
 	if (pnfs_layoutcommit_outstanding(inode)) {
-		nfsi->cache_validity |= save_cache_validity & NFS_INO_INVALID_ATTR;
+		nfsi->cache_validity |=
+			save_cache_validity &
+			(NFS_INO_INVALID_CHANGE | NFS_INO_INVALID_CTIME |
+			 NFS_INO_INVALID_MTIME | NFS_INO_INVALID_SIZE |
+			 NFS_INO_REVAL_FORCED);
 		cache_revalidated = false;
 	}
 
@@ -2211,12 +2226,32 @@ EXPORT_SYMBOL_GPL(nfs_net_id);
 
 static int nfs_net_init(struct net *net)
 {
+	struct nfs_net *nn = net_generic(net, nfs_net_id);
+	int err;
+
 	nfs_clients_init(net);
-	return nfs_fs_proc_net_init(net);
+
+	if (!rpc_proc_register(net, &nn->rpcstats)) {
+		err = -ENOMEM;
+		goto err_proc_rpc;
+	}
+
+	err = nfs_fs_proc_net_init(net);
+	if (err)
+		goto err_proc_nfs;
+
+	return 0;
+
+err_proc_nfs:
+	rpc_proc_unregister(net, "nfs");
+err_proc_rpc:
+	nfs_clients_exit(net);
+	return err;
 }
 
 static void nfs_net_exit(struct net *net)
 {
+	rpc_proc_unregister(net, "nfs");
 	nfs_fs_proc_net_exit(net);
 	nfs_clients_exit(net);
 }
@@ -2275,15 +2310,12 @@ static int __init init_nfs_fs(void)
 	if (err)
 		goto out1;
 
-	rpc_proc_register(&init_net, &nfs_rpcstat);
-
 	err = register_nfs_fs();
 	if (err)
 		goto out0;
 
 	return 0;
 out0:
-	rpc_proc_unregister(&init_net, "nfs");
 	nfs_destroy_directcache();
 out1:
 	nfs_destroy_writepagecache();
@@ -2316,7 +2348,6 @@ static void __exit exit_nfs_fs(void)
 	nfs_destroy_nfspagecache();
 	nfs_fscache_unregister();
 	unregister_pernet_subsys(&nfs_net_ops);
-	rpc_proc_unregister(&init_net, "nfs");
 	unregister_nfs_fs();
 	nfs_fs_proc_exit();
 	nfsiod_stop();

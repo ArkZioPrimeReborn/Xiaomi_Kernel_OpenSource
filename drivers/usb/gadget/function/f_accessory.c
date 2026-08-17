@@ -170,7 +170,7 @@ static struct usb_ss_ep_comp_descriptor acc_superspeedplus_comp_desc = {
 	.bDescriptorType        = USB_DT_SS_ENDPOINT_COMP,
 
 	/* the following 2 values can be tweaked if necessary */
-	/* .bMaxBurst =         0, */
+	.bMaxBurst              = 6,
 	/* .bmAttributes =      0, */
 };
 
@@ -195,7 +195,7 @@ static struct usb_ss_ep_comp_descriptor acc_superspeed_comp_desc = {
 	.bDescriptorType        = USB_DT_SS_ENDPOINT_COMP,
 
 	/* the following 2 values can be tweaked if necessary */
-	/* .bMaxBurst =         0, */
+	.bMaxBurst              = 6,
 	/* .bmAttributes =      0, */
 };
 
@@ -500,7 +500,7 @@ static void acc_complete_send_hid_event(struct usb_ep *ep,
 		return;
 	}
 
-	hid_report_raw_event(hid->hid, HID_INPUT_REPORT, req->buf, length, 1);
+	__hid_report_raw_event(hid->hid, HID_INPUT_REPORT, req->buf, length, length, 1);
 }
 
 static int acc_hid_parse(struct hid_device *hid)
@@ -931,6 +931,7 @@ static const struct file_operations acc_fops = {
 	.read = acc_read,
 	.write = acc_write,
 	.unlocked_ioctl = acc_ioctl,
+	.compat_ioctl = acc_ioctl,
 	.open = acc_open,
 	.release = acc_release,
 };
@@ -1083,6 +1084,26 @@ err:
 	return value;
 }
 EXPORT_SYMBOL_GPL(acc_ctrlrequest);
+
+int acc_ctrlrequest_composite(struct usb_composite_dev *cdev,
+			      const struct usb_ctrlrequest *ctrl)
+{
+	u16 w_length = le16_to_cpu(ctrl->wLength);
+
+	if (w_length > USB_COMP_EP0_BUFSIZ) {
+		if (ctrl->bRequestType & USB_DIR_IN) {
+			/* Cast away the const, we are going to overwrite on purpose. */
+			__le16 *temp = (__le16 *)&ctrl->wLength;
+
+			*temp = cpu_to_le16(USB_COMP_EP0_BUFSIZ);
+			w_length = USB_COMP_EP0_BUFSIZ;
+		} else {
+			return -EINVAL;
+		}
+	}
+	return acc_ctrlrequest(cdev, ctrl);
+}
+EXPORT_SYMBOL_GPL(acc_ctrlrequest_composite);
 
 static int
 __acc_function_bind(struct usb_configuration *c,

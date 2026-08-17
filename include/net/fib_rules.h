@@ -69,7 +69,14 @@ struct fib_rules_ops {
 	int			(*action)(struct fib_rule *,
 					  struct flowi *, int,
 					  struct fib_lookup_arg *);
+	/* __GENKSYMS__ hack to preserve the abi change that happened in
+	 * cdef485217d3 ("ipv6: fix memory leak in fib6_rule_suppress")
+	 */
+#ifdef __GENKSYMS__
 	bool			(*suppress)(struct fib_rule *,
+#else
+	bool			(*suppress)(struct fib_rule *, int,
+#endif
 					    struct fib_lookup_arg *);
 	int			(*match)(struct fib_rule *,
 					 struct flowi *, int);
@@ -126,6 +133,11 @@ struct fib_rule_notifier_info {
 static inline void fib_rule_get(struct fib_rule *rule)
 {
 	refcount_inc(&rule->refcnt);
+}
+
+static inline bool fib_rule_get_safe(struct fib_rule *rule)
+{
+	return refcount_inc_not_zero(&rule->refcnt);
 }
 
 static inline void fib_rule_put(struct fib_rule *rule)
@@ -218,7 +230,9 @@ INDIRECT_CALLABLE_DECLARE(int fib4_rule_action(struct fib_rule *rule,
 			    struct fib_lookup_arg *arg));
 
 INDIRECT_CALLABLE_DECLARE(bool fib6_rule_suppress(struct fib_rule *rule,
+						int flags,
 						struct fib_lookup_arg *arg));
 INDIRECT_CALLABLE_DECLARE(bool fib4_rule_suppress(struct fib_rule *rule,
+						int flags,
 						struct fib_lookup_arg *arg));
 #endif

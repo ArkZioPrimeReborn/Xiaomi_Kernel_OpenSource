@@ -91,8 +91,6 @@ static struct inode *f2fs_new_inode(struct inode *dir, umode_t mode)
 	if (test_opt(sbi, INLINE_XATTR))
 		set_inode_flag(inode, FI_INLINE_XATTR);
 
-	if (test_opt(sbi, INLINE_DATA) && f2fs_may_inline_data(inode))
-		set_inode_flag(inode, FI_INLINE_DATA);
 	if (f2fs_may_inline_dentry(inode))
 		set_inode_flag(inode, FI_INLINE_DENTRY);
 
@@ -106,12 +104,6 @@ static struct inode *f2fs_new_inode(struct inode *dir, umode_t mode)
 		xattr_size = DEFAULT_INLINE_XATTR_ADDRS;
 	}
 	F2FS_I(inode)->i_inline_xattr_size = xattr_size;
-
-	f2fs_init_extent_tree(inode, NULL);
-
-	stat_inc_inline_xattr(inode);
-	stat_inc_inline_inode(inode);
-	stat_inc_inline_dir(inode);
 
 	F2FS_I(inode)->i_flags =
 		f2fs_mask_flags(mode, F2FS_I(dir)->i_flags & F2FS_FL_INHERITED);
@@ -129,7 +121,17 @@ static struct inode *f2fs_new_inode(struct inode *dir, umode_t mode)
 			set_compress_context(inode);
 	}
 
+	/* Should enable inline_data after compression set */
+	if (test_opt(sbi, INLINE_DATA) && f2fs_may_inline_data(inode))
+		set_inode_flag(inode, FI_INLINE_DATA);
+
+	stat_inc_inline_xattr(inode);
+	stat_inc_inline_inode(inode);
+	stat_inc_inline_dir(inode);
+
 	f2fs_set_inode_flags(inode);
+
+	f2fs_init_extent_tree(inode);
 
 	trace_f2fs_new_inode(inode, 0);
 	return inode;
@@ -196,7 +198,7 @@ static inline void set_file_temperature(struct f2fs_sb_info *sbi, struct inode *
 	__u8 (*extlist)[F2FS_EXTENSION_LEN] = sbi->raw_super->extension_list;
 	int i, cold_count, hot_count;
 
-	down_read(&sbi->sb_lock);
+	f2fs_down_read(&sbi->sb_lock);
 
 	cold_count = le32_to_cpu(sbi->raw_super->extension_count);
 	hot_count = sbi->raw_super->hot_ext_count;
@@ -206,7 +208,7 @@ static inline void set_file_temperature(struct f2fs_sb_info *sbi, struct inode *
 			break;
 	}
 
-	up_read(&sbi->sb_lock);
+	f2fs_up_read(&sbi->sb_lock);
 
 	if (i == cold_count + hot_count)
 		return;
@@ -297,19 +299,19 @@ static void set_compress_inode(struct f2fs_sb_info *sbi, struct inode *inode,
 			!f2fs_may_compress(inode))
 		return;
 
-	down_read(&sbi->sb_lock);
+	f2fs_down_read(&sbi->sb_lock);
 
 	cold_count = le32_to_cpu(sbi->raw_super->extension_count);
 	hot_count = sbi->raw_super->hot_ext_count;
 
 	for (i = cold_count; i < cold_count + hot_count; i++) {
 		if (is_extension_exist(name, extlist[i], false)) {
-			up_read(&sbi->sb_lock);
+			f2fs_up_read(&sbi->sb_lock);
 			return;
 		}
 	}
 
-	up_read(&sbi->sb_lock);
+	f2fs_up_read(&sbi->sb_lock);
 
 	ext = F2FS_OPTION(sbi).extensions;
 
@@ -317,6 +319,9 @@ static void set_compress_inode(struct f2fs_sb_info *sbi, struct inode *inode,
 		if (!is_extension_exist(name, ext[i], false))
 			continue;
 
+		/* Do not use inline_data with compression */
+		stat_dec_inline_inode(inode);
+		clear_inode_flag(inode, FI_INLINE_DATA);
 		set_compress_context(inode);
 		return;
 	}
@@ -391,7 +396,7 @@ static int f2fs_link(struct dentry *old_dentry, struct inode *dir,
 
 	if (is_inode_flag_set(dir, FI_PROJ_INHERIT) &&
 			(!projid_eq(F2FS_I(dir)->i_projid,
-			F2FS_I(old_dentry->d_inode)->i_projid)))
+			F2FS_I(inode)->i_projid)))
 		return -EXDEV;
 
 	err = dquot_initialize(dir);
@@ -603,6 +608,15 @@ static int f2fs_unlink(struct inode *dir, struct dentry *dentry)
 		goto fail;
 	}
 
+	if (unlikely(inode->i_nlink == 0)) {
+		f2fs_warn(F2FS_I_SB(inode), "%s: inode (ino=%lx) has zero i_nlink",
+			  __func__, inode->i_ino);
+		err = -EFSCORRUPTED;
+		set_sbi_flag(F2FS_I_SB(inode), SBI_NEED_FSCK);
+		f2fs_put_page(page, 0);
+		goto fail;
+	}
+
 	f2fs_balance_fs(sbi, true);
 
 	f2fs_lock_op(sbi);
@@ -613,6 +627,8 @@ static int f2fs_unlink(struct inode *dir, struct dentry *dentry)
 		goto fail;
 	}
 	f2fs_delete_entry(de, page, dir, inode);
+	f2fs_unlock_op(sbi);
+
 #ifdef CONFIG_UNICODE
 	/* VFS negative dentries are incompatible with Encoding and
 	 * Case-insensitiveness. Eventually we'll want avoid
@@ -623,8 +639,6 @@ static int f2fs_unlink(struct inode *dir, struct dentry *dentry)
 	if (IS_CASEFOLDED(dir))
 		d_invalidate(dentry);
 #endif
-	f2fs_unlock_op(sbi);
-
 	if (IS_DIRSYNC(dir))
 		f2fs_sync_fs(sbi->sb, 1);
 fail:
@@ -931,12 +945,12 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	if (is_inode_flag_set(new_dir, FI_PROJ_INHERIT) &&
 			(!projid_eq(F2FS_I(new_dir)->i_projid,
-			F2FS_I(old_dentry->d_inode)->i_projid)))
+			F2FS_I(old_inode)->i_projid)))
 		return -EXDEV;
 
 	/*
 	 * If new_inode is null, the below renaming flow will
-	 * add a link in old_dir which can conver inline_dir.
+	 * add a link in old_dir which can convert inline_dir.
 	 * After then, if we failed to get the entry due to other
 	 * reasons like ENOMEM, we had to remove the new entry.
 	 * Instead of adding such the error handling routine, let's
@@ -1012,11 +1026,11 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 		new_page = NULL;
 
 		new_inode->i_ctime = current_time(new_inode);
-		down_write(&F2FS_I(new_inode)->i_sem);
+		f2fs_down_write(&F2FS_I(new_inode)->i_sem);
 		if (old_dir_entry)
 			f2fs_i_links_write(new_inode, false);
 		f2fs_i_links_write(new_inode, false);
-		up_write(&F2FS_I(new_inode)->i_sem);
+		f2fs_up_write(&F2FS_I(new_inode)->i_sem);
 
 		if (!new_inode->i_nlink)
 			f2fs_add_orphan_inode(new_inode);
@@ -1037,13 +1051,13 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 			f2fs_i_links_write(new_dir, true);
 	}
 
-	down_write(&F2FS_I(old_inode)->i_sem);
+	f2fs_down_write(&F2FS_I(old_inode)->i_sem);
 	if (!old_dir_entry || whiteout)
 		file_lost_pino(old_inode);
 	else
 		/* adjust dir's i_pino to pass fsck check */
 		f2fs_i_pino_write(old_inode, new_dir->i_ino);
-	up_write(&F2FS_I(old_inode)->i_sem);
+	f2fs_up_write(&F2FS_I(old_inode)->i_sem);
 
 	old_inode->i_ctime = current_time(old_inode);
 	f2fs_mark_inode_dirty_sync(old_inode, false);
@@ -1054,9 +1068,11 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	if (whiteout) {
 		set_inode_flag(whiteout, FI_INC_LINK);
 		err = f2fs_add_link(old_dentry, whiteout);
-		if (err)
+		if (err) {
+			d_invalidate(old_dentry);
+			d_invalidate(new_dentry);
 			goto put_out_dir;
-
+		}
 		spin_lock(&whiteout->i_lock);
 		whiteout->i_state &= ~I_LINKABLE;
 		spin_unlock(&whiteout->i_lock);
@@ -1065,7 +1081,7 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	}
 
 	if (old_dir_entry) {
-		if (old_dir != new_dir && !whiteout)
+		if (old_dir != new_dir)
 			f2fs_set_link(old_inode, old_dir_entry,
 						old_dir_page, new_dir);
 		else
@@ -1121,10 +1137,10 @@ static int f2fs_cross_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 	if ((is_inode_flag_set(new_dir, FI_PROJ_INHERIT) &&
 			!projid_eq(F2FS_I(new_dir)->i_projid,
-			F2FS_I(old_dentry->d_inode)->i_projid)) ||
-	    (is_inode_flag_set(new_dir, FI_PROJ_INHERIT) &&
+			F2FS_I(old_inode)->i_projid)) ||
+	    (is_inode_flag_set(old_dir, FI_PROJ_INHERIT) &&
 			!projid_eq(F2FS_I(old_dir)->i_projid,
-			F2FS_I(new_dentry->d_inode)->i_projid)))
+			F2FS_I(new_inode)->i_projid)))
 		return -EXDEV;
 
 	err = dquot_initialize(old_dir);
@@ -1203,38 +1219,38 @@ static int f2fs_cross_rename(struct inode *old_dir, struct dentry *old_dentry,
 	/* update directory entry info of old dir inode */
 	f2fs_set_link(old_dir, old_entry, old_page, new_inode);
 
-	down_write(&F2FS_I(old_inode)->i_sem);
+	f2fs_down_write(&F2FS_I(old_inode)->i_sem);
 	if (!old_dir_entry)
 		file_lost_pino(old_inode);
 	else
 		/* adjust dir's i_pino to pass fsck check */
 		f2fs_i_pino_write(old_inode, new_dir->i_ino);
-	up_write(&F2FS_I(old_inode)->i_sem);
+	f2fs_up_write(&F2FS_I(old_inode)->i_sem);
 
 	old_dir->i_ctime = current_time(old_dir);
 	if (old_nlink) {
-		down_write(&F2FS_I(old_dir)->i_sem);
+		f2fs_down_write(&F2FS_I(old_dir)->i_sem);
 		f2fs_i_links_write(old_dir, old_nlink > 0);
-		up_write(&F2FS_I(old_dir)->i_sem);
+		f2fs_up_write(&F2FS_I(old_dir)->i_sem);
 	}
 	f2fs_mark_inode_dirty_sync(old_dir, false);
 
 	/* update directory entry info of new dir inode */
 	f2fs_set_link(new_dir, new_entry, new_page, old_inode);
 
-	down_write(&F2FS_I(new_inode)->i_sem);
+	f2fs_down_write(&F2FS_I(new_inode)->i_sem);
 	if (!new_dir_entry)
 		file_lost_pino(new_inode);
 	else
 		/* adjust dir's i_pino to pass fsck check */
 		f2fs_i_pino_write(new_inode, old_dir->i_ino);
-	up_write(&F2FS_I(new_inode)->i_sem);
+	f2fs_up_write(&F2FS_I(new_inode)->i_sem);
 
 	new_dir->i_ctime = current_time(new_dir);
 	if (new_nlink) {
-		down_write(&F2FS_I(new_dir)->i_sem);
+		f2fs_down_write(&F2FS_I(new_dir)->i_sem);
 		f2fs_i_links_write(new_dir, new_nlink > 0);
-		up_write(&F2FS_I(new_dir)->i_sem);
+		f2fs_up_write(&F2FS_I(new_dir)->i_sem);
 	}
 	f2fs_mark_inode_dirty_sync(new_dir, false);
 

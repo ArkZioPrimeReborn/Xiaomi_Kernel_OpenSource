@@ -34,6 +34,7 @@
 #include <linux/scs.h>
 #include <linux/percpu-rwsem.h>
 #include <linux/cpuset.h>
+#include <linux/random.h>
 #include <uapi/linux/sched/types.h>
 
 #include <trace/events/power.h>
@@ -44,6 +45,7 @@
 #include <trace/hooks/sched.h>
 #include <trace/hooks/cpu.h>
 
+#include "sched/sched.h"
 #include "smpboot.h"
 
 /**
@@ -160,7 +162,7 @@ static int cpuhp_invoke_callback(unsigned int cpu, enum cpuhp_state state,
 	struct cpuhp_step *step = cpuhp_get_step(state);
 	int (*cbm)(unsigned int cpu, struct hlist_node *node);
 	int (*cb)(unsigned int cpu);
-	int ret, cnt;
+	int ret, cnt, rollback_ret;
 
 	if (st->fail == state) {
 		st->fail = CPUHP_INVALID;
@@ -226,12 +228,12 @@ err:
 			break;
 
 		trace_cpuhp_multi_enter(cpu, st->target, state, cbm, node);
-		ret = cbm(cpu, node);
-		trace_cpuhp_exit(cpu, st->state, state, ret);
+		rollback_ret = cbm(cpu, node);
+		trace_cpuhp_exit(cpu, st->state, state, rollback_ret);
 		/*
 		 * Rollback must not fail,
 		 */
-		WARN_ON_ONCE(ret);
+		WARN_ON_ONCE(rollback_ret);
 	}
 	return ret;
 }
@@ -575,6 +577,12 @@ static int bringup_cpu(unsigned int cpu)
 	/*
 	* Reset stale stack state from the last time this CPU was online.
 	*/
+	scs_task_reset(idle);
+	kasan_unpoison_task_stack(idle);
+
+	/*
+	 * Reset stale stack state from the last time this CPU was online.
+	 */
 	scs_task_reset(idle);
 	kasan_unpoison_task_stack(idle);
 
@@ -1173,8 +1181,6 @@ int remove_cpu(unsigned int cpu)
 }
 EXPORT_SYMBOL_GPL(remove_cpu);
 
-extern bool dl_cpu_busy(unsigned int cpu);
-
 int __pause_drain_rq(struct cpumask *cpus)
 {
 	unsigned int cpu;
@@ -1248,7 +1254,7 @@ int pause_cpus(struct cpumask *cpus)
 	cpumask_and(cpus, cpus, cpu_active_mask);
 
 	for_each_cpu(cpu, cpus) {
-		if (!cpu_online(cpu) || dl_cpu_busy(cpu) ||
+		if (!cpu_online(cpu) || dl_bw_check_overflow(cpu) ||
 			get_cpu_device(cpu)->offline_disabled == true) {
 			err = -EBUSY;
 			goto err_cpu_maps_update;
@@ -1876,6 +1882,22 @@ core_initcall(cpu_hotplug_pm_sync_init);
 
 int __boot_cpu_id;
 
+/* Horrific hacks because we can't add more to cpuhp_hp_states. */
+static int random_and_perf_prepare_fusion(unsigned int cpu)
+{
+#ifdef CONFIG_PERF_EVENTS
+	perf_event_init_cpu(cpu);
+#endif
+	random_prepare_cpu(cpu);
+	return 0;
+}
+static int random_and_workqueue_online_fusion(unsigned int cpu)
+{
+	workqueue_online_cpu(cpu);
+	random_online_cpu(cpu);
+	return 0;
+}
+
 #endif /* CONFIG_SMP */
 
 /* Boot processor state steps */
@@ -1894,7 +1916,7 @@ static struct cpuhp_step cpuhp_hp_states[] = {
 	},
 	[CPUHP_PERF_PREPARE] = {
 		.name			= "perf:prepare",
-		.startup.single		= perf_event_init_cpu,
+		.startup.single		= random_and_perf_prepare_fusion,
 		.teardown.single	= perf_event_exit_cpu,
 	},
 	[CPUHP_WORKQUEUE_PREP] = {
@@ -2010,7 +2032,7 @@ static struct cpuhp_step cpuhp_hp_states[] = {
 	},
 	[CPUHP_AP_WORKQUEUE_ONLINE] = {
 		.name			= "workqueue:online",
-		.startup.single		= workqueue_online_cpu,
+		.startup.single		= random_and_workqueue_online_fusion,
 		.teardown.single	= workqueue_offline_cpu,
 	},
 	[CPUHP_AP_RCUTREE_ONLINE] = {
@@ -2536,8 +2558,10 @@ static ssize_t write_cpuhp_target(struct device *dev,
 
 	if (st->state < target)
 		ret = cpu_up(dev->id, target);
-	else
+	else if (st->state > target)
 		ret = cpu_down(dev->id, target);
+	else if (WARN_ON(st->target != target))
+		st->target = target;
 out:
 	unlock_device_hotplug();
 	return ret ? ret : count;
@@ -2897,7 +2921,8 @@ enum cpu_mitigations {
 };
 
 static enum cpu_mitigations cpu_mitigations __ro_after_init =
-	CPU_MITIGATIONS_AUTO;
+	IS_ENABLED(CONFIG_CPU_MITIGATIONS) ? CPU_MITIGATIONS_AUTO :
+					     CPU_MITIGATIONS_OFF;
 
 static int __init mitigations_parse_cmdline(char *arg)
 {

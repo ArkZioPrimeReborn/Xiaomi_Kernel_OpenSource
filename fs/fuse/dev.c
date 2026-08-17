@@ -23,6 +23,8 @@
 #include <linux/splice.h>
 #include <linux/sched.h>
 
+#include <trace/hooks/fuse.h>
+
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
 
@@ -208,10 +210,13 @@ static unsigned int fuse_req_hash(u64 unique)
 /**
  * A new request is available, wake fiq->waitq
  */
-static void fuse_dev_wake_and_unlock(struct fuse_iqueue *fiq)
+static void fuse_dev_wake_and_unlock(struct fuse_iqueue *fiq, bool sync)
 __releases(fiq->lock)
 {
-	wake_up(&fiq->waitq);
+	if (sync)
+		wake_up_sync(&fiq->waitq);
+	else
+		wake_up(&fiq->waitq);
 	kill_fasync(&fiq->fasync, SIGIO, POLL_IN);
 	spin_unlock(&fiq->lock);
 }
@@ -224,14 +229,15 @@ const struct fuse_iqueue_ops fuse_dev_fiq_ops = {
 EXPORT_SYMBOL_GPL(fuse_dev_fiq_ops);
 
 static void queue_request_and_unlock(struct fuse_iqueue *fiq,
-				     struct fuse_req *req)
+				     struct fuse_req *req, bool sync)
 __releases(fiq->lock)
 {
 	req->in.h.len = sizeof(struct fuse_in_header) +
 		fuse_len_args(req->args->in_numargs,
 			      (struct fuse_arg *) req->args->in_args);
 	list_add_tail(&req->list, &fiq->pending);
-	fiq->ops->wake_pending_and_unlock(fiq);
+	trace_android_vh_queue_request_and_unlock(&fiq->waitq, sync);
+	fiq->ops->wake_pending_and_unlock(fiq, sync);
 }
 
 void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
@@ -246,7 +252,7 @@ void fuse_queue_forget(struct fuse_conn *fc, struct fuse_forget_link *forget,
 	if (fiq->connected) {
 		fiq->forget_list_tail->next = forget;
 		fiq->forget_list_tail = forget;
-		fiq->ops->wake_forget_and_unlock(fiq);
+		fiq->ops->wake_forget_and_unlock(fiq, false);
 	} else {
 		kfree(forget);
 		spin_unlock(&fiq->lock);
@@ -266,7 +272,7 @@ static void flush_bg_queue(struct fuse_conn *fc)
 		fc->active_background++;
 		spin_lock(&fiq->lock);
 		req->in.h.unique = fuse_get_unique(fiq);
-		queue_request_and_unlock(fiq, req);
+		queue_request_and_unlock(fiq, req, false);
 	}
 }
 
@@ -289,10 +295,10 @@ void fuse_request_end(struct fuse_req *req)
 
 	/*
 	 * test_and_set_bit() implies smp_mb() between bit
-	 * changing and below intr_entry check. Pairs with
+	 * changing and below FR_INTERRUPTED check. Pairs with
 	 * smp_mb() from queue_interrupt().
 	 */
-	if (!list_empty(&req->intr_entry)) {
+	if (test_bit(FR_INTERRUPTED, &req->flags)) {
 		spin_lock(&fiq->lock);
 		list_del_init(&req->intr_entry);
 		spin_unlock(&fiq->lock);
@@ -327,6 +333,7 @@ void fuse_request_end(struct fuse_req *req)
 	} else {
 		/* Wake up waiter sleeping in request_wait_answer() */
 		wake_up(&req->waitq);
+		trace_android_vh_fuse_request_end(current);
 	}
 
 	if (test_bit(FR_ASYNC, &req->flags))
@@ -359,7 +366,7 @@ static int queue_interrupt(struct fuse_req *req)
 			spin_unlock(&fiq->lock);
 			return 0;
 		}
-		fiq->ops->wake_interrupt_and_unlock(fiq);
+		fiq->ops->wake_interrupt_and_unlock(fiq, false);
 	} else {
 		spin_unlock(&fiq->lock);
 	}
@@ -426,7 +433,7 @@ static void __fuse_request_send(struct fuse_req *req)
 		/* acquire extra reference, since request is still needed
 		   after fuse_request_end() */
 		__fuse_get_request(req);
-		queue_request_and_unlock(fiq, req);
+		queue_request_and_unlock(fiq, req, true);
 
 		request_wait_answer(req);
 		/* Pairs with smp_wmb() in fuse_request_end() */
@@ -601,7 +608,7 @@ static int fuse_simple_notify_reply(struct fuse_mount *fm,
 
 	spin_lock(&fiq->lock);
 	if (fiq->connected) {
-		queue_request_and_unlock(fiq, req);
+		queue_request_and_unlock(fiq, req, false);
 	} else {
 		err = -ENODEV;
 		spin_unlock(&fiq->lock);
@@ -861,6 +868,12 @@ static int fuse_try_move_page(struct fuse_copy_state *cs, struct page **pagep)
 	if (!(buf->flags & PIPE_BUF_FLAG_LRU))
 		lru_cache_add(newpage);
 
+	/*
+	 * Release while we have extra ref on stolen page.  Otherwise
+	 * anon_pipe_buf_release() might think the page can be reused.
+	 */
+	pipe_buf_release(cs->pipe, buf);
+
 	err = 0;
 	spin_lock(&cs->req->waitq.lock);
 	if (test_bit(FR_ABORTED, &cs->req->flags))
@@ -926,7 +939,7 @@ static int fuse_ref_page(struct fuse_copy_state *cs, struct page *page,
 	cs->nr_segs++;
 	cs->len = 0;
 
-	return 0;
+	return lock_request(cs->req);
 }
 
 /*
@@ -944,7 +957,17 @@ static int fuse_copy_page(struct fuse_copy_state *cs, struct page **pagep,
 
 	while (count) {
 		if (cs->write && cs->pipebufs && page) {
-			return fuse_ref_page(cs, page, offset, count);
+			/*
+			 * Can't control lifetime of pipe buffers, so always
+			 * copy user pages.
+			 */
+			if (cs->req->args->user_pages) {
+				err = fuse_copy_fill(cs);
+				if (err)
+					return err;
+			} else {
+				return fuse_ref_page(cs, page, offset, count);
+			}
 		} else if (!cs->len) {
 			if (cs->move_pages && page &&
 			    offset == 0 && count == PAGE_SIZE) {
@@ -1592,6 +1615,10 @@ static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
 	inode = fuse_ilookup(fc, nodeid,  NULL);
 	if (!inode)
 		goto out_up_killsb;
+	if (!S_ISREG(inode->i_mode)) {
+		err = -EINVAL;
+		goto out_iput;
+	}
 
 	mapping = inode->i_mapping;
 	index = outarg.offset >> PAGE_SHIFT;
@@ -1616,9 +1643,11 @@ static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
 
 		this_num = min_t(unsigned, num, PAGE_SIZE - offset);
 		err = fuse_copy_page(cs, &page, offset, this_num, 0);
-		if (!err && offset == 0 &&
-		    (this_num == PAGE_SIZE || file_size == end))
+		if (!PageUptodate(page) && !err && offset == 0 &&
+		    (this_num == PAGE_SIZE || file_size == end)) {
+			zero_user_segment(page, this_num, PAGE_SIZE);
 			SetPageUptodate(page);
+		}
 		unlock_page(page);
 		put_page(page);
 
@@ -1711,6 +1740,10 @@ static int fuse_retrieve(struct fuse_mount *fm, struct inode *inode,
 		page = find_get_page(mapping, index);
 		if (!page)
 			break;
+		if (!PageUptodate(page)) {
+			put_page(page);
+			break;
+		}
 
 		this_num = min_t(unsigned, num, PAGE_SIZE - offset);
 		ap->pages[ap->num_pages] = page;
@@ -1761,7 +1794,10 @@ static int fuse_notify_retrieve(struct fuse_conn *fc, unsigned int size,
 
 	inode = fuse_ilookup(fc, nodeid, &fm);
 	if (inode) {
-		err = fuse_retrieve(fm, inode, &outarg);
+		if (!S_ISREG(inode->i_mode))
+			err = -EINVAL;
+		else
+			err = fuse_retrieve(fm, inode, &outarg);
 		iput(inode);
 	}
 	up_read(&fc->killsb);
@@ -2048,8 +2084,12 @@ static ssize_t fuse_dev_splice_write(struct pipe_inode_info *pipe,
 
 	pipe_lock(pipe);
 out_free:
-	for (idx = 0; idx < nbuf; idx++)
-		pipe_buf_release(pipe, &bufs[idx]);
+	for (idx = 0; idx < nbuf; idx++) {
+		struct pipe_buffer *buf = &bufs[idx];
+
+		if (buf->ops)
+			pipe_buf_release(pipe, buf);
+	}
 	pipe_unlock(pipe);
 
 	kvfree(bufs);

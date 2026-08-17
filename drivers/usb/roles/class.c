@@ -103,13 +103,21 @@ static void *usb_role_switch_match(struct fwnode_handle *fwnode, const char *id,
 static struct usb_role_switch *
 usb_role_switch_is_parent(struct fwnode_handle *fwnode)
 {
-	struct fwnode_handle *parent = fwnode_get_parent(fwnode);
+	struct fwnode_handle *parent;
 	struct device *dev;
 
-	if (!parent || !fwnode_property_present(parent, "usb-role-switch"))
+	if (fwnode_property_match_string(fwnode, "compatible", "usb-b-connector") < 0)
 		return NULL;
 
+	parent = fwnode_get_parent(fwnode);
+
+	if (!fwnode_property_present(parent, "usb-role-switch")) {
+		fwnode_handle_put(parent);
+		return NULL;
+	}
+
 	dev = class_find_device_by_fwnode(role_class, parent);
+	fwnode_handle_put(parent);
 	return dev ? to_role_switch(dev) : ERR_PTR(-EPROBE_DEFER);
 }
 
